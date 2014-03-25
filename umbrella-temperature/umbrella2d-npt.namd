@@ -1,0 +1,265 @@
+# validate replica_neighbors proc - works in tclsh
+for { set i 0 } { $i < $num_replicas } { incr i } {
+  set j 0
+  foreach nbr [replica_neighbors $i] {
+    if { $nbr < 0 } {
+      error "replica_neighbors inconsistency detected: neighbor $j of replica $i is $nbr but should not be negative" 
+    }
+    if { $nbr >= $num_replicas } {
+      error "replica_neighbors inconsistency detected: neighbor $j of replica $i is $nbr but there are only $num_replicas replicas" 
+    }
+    set rnbrl [replica_neighbors $nbr]
+    set rnbrc [llength $rnbrl]
+    if { $j >= $rnbrc } {
+      error "replica_neighbors inconsistency detected: neighbor $j of replica $i is $nbr but replica $nbr has only $rnbrc neighbors" 
+    }
+    set rnbr [lindex $rnbrl $j]
+    if { $rnbr != $i } {
+      error "replica_neighbors inconsistency detected: neighbor $j of replica $i is $nbr but neighbor $j of replica $nbr is $rnbr" 
+    }
+    incr j
+  }
+}
+puts "replica_neighbors proc passes internal consistency check"
+
+# bail if this is not NAMD
+if { [catch numPes] } {
+  puts "Tcl interpreter does not appear to be NAMD - script exiting"
+  return
+}
+
+replicaBarrier
+
+set nr [numReplicas]
+if { $num_replicas != $nr } {
+    error "restart with wrong number of replicas"
+}
+set r [myReplica]
+set replica_id $r
+
+if {[info exists restart_root]} { #restart
+  set restart_root [format $restart_root $replica_id]
+  source $restart_root.$replica_id.tcl
+} else {
+  set i_job 0 
+  set i_run 0
+  set i_step 0
+  if {[info exists first_timestep]} {
+    set i_step $first_timestep
+  }
+
+  set replica(index) $r
+  set nnbr 0
+  set inbr 0
+  foreach nbr [umbrella_neighbors $r] {
+    set replica(loc.$inbr) $nbr
+    set replica(index.$inbr) $nbr
+    set replica(exchanges_attempted.$inbr) 0
+    set replica(exchanges_accepted.$inbr) 0
+    incr inbr 2
+    incr nnbr
+  }
+
+  set inbr 1
+  foreach nbr [temp_neighbors $r] {
+    set replica(loc.$inbr) $nbr
+    set replica(index.$inbr) $nbr
+    set replica(exchanges_attempted.$inbr) 0
+    set replica(exchanges_accepted.$inbr) 0
+    incr inbr 2
+    incr nnbr
+  }
+  set replica(num_neighbors) $nnbr
+}
+
+set job_output_root "$output_root.job$i_job"
+firsttimestep $i_step
+
+set replica(colvarbias) [replica_bias $replica(index)]
+for { set i 0 } { $i < $replica(num_neighbors) } { incr i } {
+  set replica(colvarbias.$i) [replica_bias $replica(index.$i)]
+  set replica(colvarbias.$i) [replica_bias $replica(index.$i)]
+}
+
+set replica(temperature) [replica_temp $replica(index)]
+for { set i 0 } { $i < $replica(num_neighbors) } { incr i } {
+  set replica(temperature.$i) [replica_temp $replica(index.$i)]
+  set replica(temperature.$i) [replica_temp $replica(index.$i)]
+}
+
+
+proc save_callback {labels values} {
+  global saved_labels saved_values
+  set saved_labels $labels
+  set saved_values $values
+}
+callback save_callback
+
+proc save_array {} {
+  global saved_labels saved_values saved_array
+  foreach label $saved_labels value $saved_values {
+    set saved_array($label) $value
+  }
+}
+
+set NEWTEMP $replica(temperature)
+seed [expr int(0*srand(int(100000*rand()) + 100*$replica_id) + 100000*rand())]
+langevinTemp $NEWTEMP
+langevinPistonTemp $NEWTEMP
+outputname [format $job_output_root.$replica_id $replica_id]
+
+if {$i_run} { #restart
+  bincoordinates $restart_root.$replica_id.coor
+  binvelocities $restart_root.$replica_id.vel
+  extendedSystem $restart_root.$replica_id.xsc
+  colvarsInput $restart_root.$replica_id.colvars.state
+} elseif { [info exists input_root] } {
+  set ir [format $input_root $replica_id $replica_id]
+  bincoordinates $ir.coor
+  binvelocities $ir.vel
+  extendedSystem $ir.xsc
+} else {
+  temperature $NEWTEMP
+}
+
+#outputEnergies [expr $steps_per_run / 10]
+outputEnergies [expr $steps_per_run]
+dcdFreq [expr $steps_per_run * $runs_per_frame]
+
+source $namd_config_file
+
+eval colvarbias [concat changeconfig $replica(colvarbias)]
+
+set history_file [open [format "$job_output_root.$replica_id.history" $replica_id] "w"]
+fconfigure $history_file -buffering line
+
+while {$i_run < $num_runs} {
+
+  run $steps_per_run
+  save_array
+  incr i_step $steps_per_run
+  set TEMP $saved_array(TEMP)
+  set VOLUME $saved_array(VOLUME)
+  set PRESS [expr 1.01325 * pow(1.4383, -5)]
+  set POTENTIAL [expr $saved_array(TOTAL) - $saved_array(KINETIC)];
+  set colvar [expr $saved_array(MISC)]
+
+  puts $history_file "$i_step $replica(index) $NEWTEMP $TEMP $POTENTIAL $colvar $VOLUME"
+
+  set swap [expr $i_run % $replica(num_neighbors)]
+  set temp $replica(temperature)
+  set temp2 $replica(temperature.$swap)
+
+  set doswap 0
+  if { $replica(index) < $replica(index.$swap) } {
+    set BOLTZMAN 0.001987191
+
+    if { $temp == $temp2 } {
+      set ediff [eval colvarbias [concat energydiff $replica(colvarbias.$swap)]]
+      set ediff2 [replicaRecv $replica(loc.$swap)]
+      set delta [expr ($ediff + $ediff2) / ( $BOLTZMAN * $temp )]
+    } else {
+      set vol $VOLUME
+      set vol2 [replicaRecv $replica(loc.$swap)]
+      set dbeta [expr ((1.0/$temp) - (1.0/$temp2)) / $BOLTZMAN]
+      set pot $POTENTIAL
+      set pot2 [replicaRecv $replica(loc.$swap)]
+      set delta [expr $dbeta * ($pot2 - $pot) + $dbeta * $PRESS * ($vol2 - $vol) ]
+    }
+
+    set doswap [expr $delta < 0. || exp(-1. * $delta) > rand()]
+    replicaSend $doswap $replica(loc.$swap)
+    if { $doswap } {
+      set rid $replica(index)
+      set rid2 $replica(index.$swap)
+      puts stderr "EXCHANGE_ACCEPT $rid ($temp) $rid2 ($temp2) RUN $i_run"
+      incr replica(exchanges_accepted.$swap)
+    }
+    incr replica(exchanges_attempted.$swap)
+  }
+  if { $replica(index) > $replica(index.$swap) } {
+    if { $temp == $temp2 } {
+      set ediff [eval colvarbias [concat energydiff $replica(colvarbias.$swap)]]
+      replicaSend $ediff $replica(loc.$swap)
+      set doswap [replicaRecv $replica(loc.$swap)]
+    } else {
+      replicaSend $VOLUME $replica(loc.$swap)
+      replicaSend $POTENTIAL $replica(loc.$swap)
+      set doswap [replicaRecv $replica(loc.$swap)]
+    }
+  }
+
+  set newloc $r
+  if { $doswap } {
+    set newloc $replica(loc.$swap)
+    set replica(loc.$swap) $r
+  }
+  for { set i 0 } { $i < $replica(num_neighbors) } { incr i } {
+    if { $i != $swap } {
+      set replica(loc.$i) [replicaSendrecv $newloc $replica(loc.$i) $replica(loc.$i)]
+    }
+  }
+  set oldidx $replica(index)
+  if { $doswap } {
+    set OLDTEMP $replica(temperature)
+    array set replica [replicaSendrecv [array get replica] $newloc $newloc]
+    set NEWTEMP $replica(temperature)
+    eval colvarbias [concat changeconfig $replica(colvarbias)]
+    rescalevels [expr sqrt(1.0*$NEWTEMP/$OLDTEMP)]
+    langevinTemp $NEWTEMP
+    langevinPistonTemp $NEWTEMP
+  }
+
+  # puts stderr "iteration $i_run replica $replica(index) now on rank $r"
+  # replicaBarrier
+
+  incr i_run
+
+  if { $i_run % ($runs_per_frame * $frames_per_restart) == 0 ||
+        $i_run == $num_runs } {  # restart
+    set restart_root "$job_output_root.restart$i_run"
+    set rroot [format $restart_root.$replica_id $replica_id]
+    output $rroot
+    set oroot [format $job_output_root.$replica_id $replica_id]
+    file rename -force $oroot.colvars.state $rroot.colvars.state
+    set rfile [open [format "$restart_root.$replica_id.tcl" $replica_id] "w"]
+    puts $rfile [list array set replica [array get replica]]
+    close $rfile
+    replicaBarrier
+    if { $replica_id == 0 } {
+      set rfile [open [format "$restart_root.tcl" ""] "w"]
+      puts $rfile [list set i_job [expr $i_job + 1]]
+      puts $rfile [list set i_run $i_run]
+      puts $rfile [list set i_step $i_step]
+      puts $rfile [list set restart_root $restart_root]
+      close $rfile
+      if [info exists old_restart_root] {
+        set oldroot [format $old_restart_root ""]
+        file delete $oldroot.tcl
+      }
+    }
+    replicaBarrier
+    if [info exists old_restart_root] {
+      set oldroot [format $old_restart_root $replica_id]
+      file delete $oldroot.$replica_id.tcl
+      file delete $oldroot.$replica_id.coor
+      file delete $oldroot.$replica_id.vel
+      file delete $oldroot.$replica_id.xsc
+      file delete $oldroot.$replica_id.colvars.state
+    }
+    set old_restart_root $restart_root
+  }
+}
+
+for { set i 0 } { $i < $replica(num_neighbors) } { incr i } {
+  set attempts $replica(exchanges_attempted.$i)
+  if $attempts {
+    set accepts $replica(exchanges_accepted.$i)
+    set ratio [expr 1.0*$accepts/$attempts]
+    puts stderr "EXCHANGE_RATIO $replica(index) $replica(index.$i) $accepts $attempts $ratio"
+  }
+}
+
+replicaBarrier
+
+
