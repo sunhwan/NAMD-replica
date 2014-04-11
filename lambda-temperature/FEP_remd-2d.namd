@@ -1,0 +1,264 @@
+	replicaBarrier
+
+	set nr [numReplicas]
+	if { $num_replicas != $nr } {
+	    error "restart with wrong number of replicas"
+	}
+	set r [myReplica]
+	set replica_id $r
+
+	if {[info exists restart_root]} { #restart
+	  set restart_root [format $restart_root $replica_id]
+	  source $restart_root.$replica_id.tcl
+	} else {
+	  set i_job 0 
+	  set i_run 0
+	  set i_step 0
+	  if {[info exists first_timestep]} {
+	    set i_step $first_timestep
+	  }
+
+	  set replica(index) $r
+	  set replica(ParamID) $r
+
+	  set replica(index) $r
+	  set nnbr 0
+	  set inbr 0
+	  foreach nbr [lambda_neighbors $r] {
+	    set replica(loc.$inbr) $nbr
+	    set replica(index.$inbr) $nbr
+	    set replica(exchanges_attempted.$inbr) 0
+	    set replica(exchanges_accepted.$inbr) 0
+	    incr inbr 2
+	    incr nnbr
+	  }
+
+	  set inbr 1
+	  foreach nbr [temp_neighbors $r] {
+	    set replica(loc.$inbr) $nbr
+	    set replica(index.$inbr) $nbr
+	    set replica(exchanges_attempted.$inbr) 0
+	    set replica(exchanges_accepted.$inbr) 0
+	    incr inbr 2
+	    incr nnbr
+	  }
+
+	  set replica(num_neighbors) $nnbr
+	}
+
+	set job_output_root "$output_root.job$i_job"
+	firsttimestep $i_step
+
+	proc setup_parameters { ID } {
+	  set Lambda [replica_lambda $ID]
+	  alchLambda    [lindex $Lambda 0]
+	  alchLambda2   [lindex $Lambda 1]
+	}
+
+	proc save_callback {labels values} {
+	  global saved_labels saved_values
+	  set saved_labels $labels
+	  set saved_values $values
+	}
+	callback save_callback
+
+	proc save_array {} {
+	  global saved_labels
+	  global saved_values
+	  global saved_array
+	  foreach label $saved_labels value $saved_values {
+	    set saved_array($label) $value
+	  }
+	}
+
+	set replica(temperature) [replica_temp $replica(index)]
+	for { set i 0 } { $i < $replica(num_neighbors) } { incr i } {
+	  set replica(temperature.$i) [replica_temp $replica(index.$i)]
+	  set replica(temperature.$i) [replica_temp $replica(index.$i)]
+	}
+
+	set NEWTEMP $replica(temperature)
+	seed [expr int(0*srand(int(100000*rand()) + 100*$replica_id) + 100000*rand())]
+	langevinTemp $NEWTEMP
+	langevinPistonTemp $NEWTEMP
+	outputname [format $job_output_root.$replica_id $replica_id]
+
+	if {$i_run} { #restart
+	  bincoordinates $restart_root.$replica_id.coor
+	  binvelocities $restart_root.$replica_id.vel
+  extendedSystem $restart_root.$replica_id.xsc
+} else {
+  bincoordinates input/step4_equilibration.restart.coor
+  extendedSystem input/step4_equilibration.restart.xsc
+
+  temperature $NEWTEMP
+}
+
+outputEnergies [expr $steps_per_run]
+dcdFreq [expr $steps_per_run * $runs_per_frame]
+
+source $namd_config_file
+alchOutFile             [format $job_output_root.$replica_id.wham.fepout $replica_id]
+setup_parameters $replica(ParamID)
+
+set history_file [open [format "$job_output_root.$replica_id.history" $replica_id] "w"]
+fconfigure $history_file -buffering line
+
+while {$i_run < $num_runs} {
+  if { $i_run == 0 } {
+    minimize 20
+    run 5000
+  }
+
+  set swap [expr $i_run % $replica(num_neighbors)]
+  set temp $replica(temperature)
+  set temp2 $replica(temperature.$swap)
+
+  run $steps_per_run
+  save_array
+  incr i_step $steps_per_run
+  set POTENTIAL [expr $saved_array(TOTAL) - $saved_array(KINETIC)]
+
+  set doswap 0
+
+  #if { $replica(index) < $replica(index.$swap) } {
+  #  replicaSend $POTENTIAL $replica(loc.$swap)
+  #  set POTENTIAL2 [replicaRecv $replica(loc.$swap)]
+  #}
+  #if { $replica(index) > $replica(index.$swap) } {
+  #  replicaSend $POTENTIAL $replica(loc.$swap)
+  #  set POTENTIAL2 [replicaRecv $replica(loc.$swap)]
+  #}
+  set POTENTIAL2 [replicaSendrecv $POTENTIAL $replica(loc.$swap) $replica(loc.$swap)]
+
+  if { $replica(index) != $replica(index.$swap) } {
+    set replica(ParamID) $replica(index.$swap)
+    setup_parameters $replica(ParamID)
+  
+    run 0
+    save_array
+    set VOLUME $saved_array(VOLUME)
+    set PRESS [expr 1.01325 * pow(1.4383, -5)]
+    set POTENTIAL_NEW [expr $saved_array(TOTAL) - $saved_array(KINETIC)]
+    set POTENTIAL_NEW2 [replicaSendrecv $POTENTIAL_NEW $replica(loc.$swap) $replica(loc.$swap)]
+    #if { $replica(index) < $replica(index.$swap) } {
+    #  replicaSend $POTENTIAL_NEW $replica(loc.$swap)
+    #  set POTENTIAL_NEW2 [replicaRecv $replica(loc.$swap)]
+    #}
+    #if { $replica(index) > $replica(index.$swap) } {
+    #  replicaSend $POTENTIAL_NEW $replica(loc.$swap)
+    #  set POTENTIAL_NEW2 [replicaRecv $replica(loc.$swap)]
+    #}
+
+    if { $replica(index) < $replica(index.$swap) } {
+      set BOLTZMAN 0.001987191
+
+      if { $temp == $temp2 } {
+        set delta [expr ($POTENTIAL_NEW + $POTENTIAL_NEW2 - $POTENTIAL - $POTENTIAL2)/($BOLTZMAN * $temp)]
+      } else {
+        set vol $VOLUME
+        set vol2 $VOLUME 
+        #set vol2 [replicaRecv $replica(loc.$swap)]
+        set dbeta [expr ((1.0/$temp) - (1.0/$temp2)) / $BOLTZMAN]
+        set pot $POTENTIAL
+        set pot2 $POTENTIAL2
+        set delta [expr $dbeta * ($pot2 - $pot) + $dbeta * $PRESS * ($vol2 - $vol) ]
+      }
+
+      set doswap [expr $delta < 0. || exp(-1. * $delta) > rand()]
+
+      replicaSend $doswap $replica(loc.$swap)
+      puts $history_file "$i_step $replica(index)<->$replica(index.$swap) $POTENTIAL $POTENTIAL2 $POTENTIAL_NEW $POTENTIAL_NEW2 $VOLUME $doswap"
+#     flush $history_file
+      if { $doswap } {
+        puts stderr "EXCHANGE_ACCEPT $replica(index) $replica(index.$swap) RUN $i_run"
+        incr replica(exchanges_accepted)
+      }
+      incr replica(exchanges_attempted)
+    }
+    if { $replica(index) > $replica(index.$swap) } {
+      #if { $temp != $temp2 } {
+      #  replicaSend $VOLUME $replica(loc.$swap)
+      #}
+
+      set doswap [replicaRecv $replica(loc.$swap)]
+      puts $history_file "$i_step $replica(index)<->$replica(index.$swap) $POTENTIAL $POTENTIAL2 $POTENTIAL_NEW $POTENTIAL_NEW2 $VOLUME $doswap"
+#     flush $history_file
+    }
+  }
+
+  set newloc $r
+  if { $doswap } {
+    set newloc $replica(loc.$swap)
+    set replica(loc.$swap) $r
+  } else {
+    set replica(ParamID) $replica(index)
+    setup_parameters $replica(ParamID)
+  }
+  for { set i 0 } { $i < $replica(num_neighbors) } { incr i } {
+    if { $i != $swap } {
+      set replica(loc.$i) [replicaSendrecv $newloc $replica(loc.$i) $replica(loc.$i)]
+    }
+  }
+  if { $doswap } { 
+    set OLDTEMP $replica(temperature)
+    array set replica [replicaSendrecv [array get replica] $newloc $newloc]
+    set NEWTEMP $replica(temperature)
+    rescalevels [expr sqrt(1.0*$NEWTEMP/$OLDTEMP)]
+    langevinTemp $NEWTEMP
+    langevinPistonTemp $NEWTEMP
+  }
+  
+#  puts $history_file "Check state: id=$r ParaID= $replica(ParamID)"
+#  puts $history_file [array get replica]
+#  flush $history_file
+ 
+  incr i_run
+
+
+  if { $i_run % ($runs_per_frame * $frames_per_restart) == 0 ||
+        $i_run == $num_runs } {  # restart
+    set restart_root "$job_output_root.restart$i_run"
+    output [format $restart_root.$replica_id $replica_id]
+    set rfile [open [format "$restart_root.$replica_id.tcl" $replica_id] "w"]
+    puts $rfile [list array set replica [array get replica]]
+    close $rfile
+    replicaBarrier
+    if { $replica_id == 0 } {
+      set rfile [open [format "$restart_root.tcl" ""] "w"]
+      puts $rfile [list set i_job [expr $i_job + 1]]
+      puts $rfile [list set i_run $i_run]
+      puts $rfile [list set i_step $i_step]
+      puts $rfile [list set restart_root $restart_root]
+      close $rfile
+      if [info exists old_restart_root] {
+        set oldroot [format $old_restart_root ""]
+        file delete $oldroot.tcl
+      }
+    }
+    replicaBarrier
+    if [info exists old_restart_root] {
+      set oldroot [format $old_restart_root $replica_id]
+      file delete $oldroot.$replica_id.tcl
+      file delete $oldroot.$replica_id.coor
+      file delete $oldroot.$replica_id.vel
+      file delete $oldroot.$replica_id.xsc
+    }
+    set old_restart_root $restart_root
+  }
+}
+
+set attempts $replica(exchanges_attempted)
+if $attempts {
+  set i $replica(index)
+  if { $replica(index.a) > $i } {
+    set swap a
+  } else {
+    set swap b
+  }
+  set accepts $replica(exchanges_accepted)
+  set ratio [expr 1.0*$accepts/$attempts]
+  puts stderr "EXCHANGE_RATIO $replica(index) $replica(index.$swap) $accepts $attempts $ratio"
+}
+
+replicaBarrier
