@@ -1,4 +1,4 @@
 NAMD-replica
 ============
 
-Replica-exchange tools for NAMD
+Replica-exchange tools for NAMD.

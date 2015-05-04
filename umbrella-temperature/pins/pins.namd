@@ -1,0 +1,370 @@
+# bail if this is not NAMD
+if { [catch numPes] } {
+  puts "Tcl interpreter does not appear to be NAMD - script exiting"
+  return
+}
+
+replicaBarrier
+
+set nr [numReplicas]
+if { $num_replicas != $nr } {
+    error "restart with wrong number of replicas"
+}
+
+set r [myReplica]
+set replica_id $r
+
+# factorial
+proc factorial {num} {
+   set fact 1
+   for { set i 1 } { $i <= $num } { incr i } {
+      set fact [expr $fact * $i]
+   }
+   return $fact
+}
+
+# Procedure that accepts a permutation of a set of elements and returns
+# the next permutatation in lexicographic sequence. 
+# from: http://www2.tcl.tk/11262
+proc nextperm { perm } {
+  # Find the smallest subscript j such that we have already visited
+  # all permutations beginning with the first j elements.
+  set j [expr { [llength $perm] - 1 }]
+  set ajp1 [lindex $perm $j]
+  while { $j > 0 } {
+    incr j -1
+    set aj [lindex $perm $j]
+    if { $ajp1 > $aj } {
+      set foundj {}
+      break
+    }
+    set ajp1 $aj
+  }
+  if { ![info exists foundj] } return
+
+  # Find the smallest element greater than the j'th among the elements
+  # following aj. Let its index be l, and interchange aj and al.
+  set l [expr { [llength $perm] - 1 }]
+  while { $aj >= [set al [lindex $perm $l]] } {
+    incr l -1
+  }
+  lset perm $j $al
+  lset perm $l $aj
+
+  # Reverse a_j+1 ... an
+  set k [expr {$j + 1}]
+  set l [expr { [llength $perm] - 1 }]
+  while { $k < $l } {
+    set al [lindex $perm $l]
+    lset perm $l [lindex $perm $k]
+    lset perm $k $al
+    incr k
+    incr l -1
+  }
+
+  return $perm
+}
+
+
+if {[info exists restart_root]} { #restart
+  set restart_root [format $restart_root $replica_id]
+  source $restart_root.$replica_id.tcl
+} else {
+  set i_job 0 
+  set i_run 0
+  set i_step 0
+  if {[info exists first_timestep]} {
+    set i_step $first_timestep
+  }
+
+  for { set i 0 } { $i < $num_replicas } { incr i } {
+    set replica(colvarbias.$i) [replica_bias $i]
+    set replica(temperature.$i) [replica_temp $i]
+    set replica(loc.$i) $i
+  }
+  set replica(index) $r
+}
+
+for { set i 0 } { $i < $num_chains } { incr i } {
+  set sum 0
+  for { set j 0 } { $j < $chain($i.num_blocks) } { incr j } {
+    set chain($i.block.$j) {}
+    set block [lindex $chain($i.block) $j]
+    for { set l 0 } { $l < [llength [lindex $block 1]]} { incr l } {
+      for { set k 0 } { $k < [llength [lindex $block 0]]} { incr k } {
+        set ix [lindex [lindex $block 0] $k]
+        set iy [lindex [lindex $block 1] $l]
+        lappend chain($i.block.$j) [expr $iy*$num_umbrella + $ix]
+      }
+    }
+    set sum [expr $sum + [llength $chain($i.block.$j)]]
+  }
+  if { $sum != $num_replicas } {
+    error "number of replicas in chain $i does not match with num_replicas ($sum != $num_replicas)"  
+  }
+}
+
+for { set i 0 } { $i < $num_chains } { incr i } {
+  for { set j 0 } { $j < $chain($i.num_blocks) } { incr j } {
+    set xblock [lindex [lindex $chain($i.block) $j] 0]
+    set yblock [lindex [lindex $chain($i.block) $j] 1]
+    set chain($i.block.$j.num_perms) [expr [factorial [expr [llength $xblock] * [llength $yblock]]]]
+
+    set perm {}
+    for { set q 0 } { $q < [llength $yblock]} { incr q } {
+      for { set p 0 } { $p < [llength $xblock]} { incr p } {
+        lappend perm [expr [lindex $yblock $q]*$num_umbrella + [lindex $xblock $p]]
+      }
+    }
+
+    set iperm 0
+    for { set l 0 } { $l < $chain($i.block.$j.num_perms) } { incr l } {
+      if { $l == 0 } { 
+        set perm [lsort -integer $perm]
+      } else {
+        set perm [nextperm $perm]
+      }
+      set chain($i.block.$j.perm.$iperm) $perm
+      incr iperm 
+      #if { $r == 0 } { puts stderr [concat $l $perm] }
+    }
+  }
+}
+
+set job_output_root "$output_root.job$i_job"
+firsttimestep $i_step
+
+proc save_callback {labels values} {
+  global saved_labels saved_values
+  set saved_labels $labels
+  set saved_values $values
+}
+callback save_callback
+
+proc save_array {} {
+  global saved_labels saved_values saved_array
+  foreach label $saved_labels value $saved_values {
+    set saved_array($label) $value
+  }
+}
+
+set NEWTEMP $replica(temperature.$replica(index))
+seed [expr int(0*srand(int(100000*rand()) + 100*$replica_id) + 100000*rand())]
+langevinTemp $NEWTEMP
+langevinPistonTemp $NEWTEMP
+outputname [format $job_output_root.$replica_id $replica_id]
+
+if {$i_run} { #restart
+  bincoordinates $restart_root.$replica_id.coor
+  binvelocities $restart_root.$replica_id.vel
+  extendedSystem $restart_root.$replica_id.xsc
+  colvarsInput $restart_root.$replica_id.colvars.state
+} elseif { [info exists input_root] } {
+  set ir [format $input_root $replica_id $replica_id]
+  bincoordinates $ir.coor
+  binvelocities $ir.vel
+  extendedSystem $ir.xsc
+} else {
+  temperature $NEWTEMP
+}
+
+#outputEnergies [expr $steps_per_run / 10]
+outputEnergies [expr $steps_per_run]
+dcdFreq [expr $steps_per_run * $runs_per_frame]
+
+source $namd_config_file
+
+eval colvarbias [concat changeconfig $replica(colvarbias.$replica(index))]
+
+set history_file [open [format "$job_output_root.$replica_id.history" $replica_id] "w"]
+fconfigure $history_file -buffering line
+
+while {$i_run < $num_runs} {
+
+  run $steps_per_run
+  save_array
+  incr i_step $steps_per_run
+  set TEMP $saved_array(TEMP)
+  #set VOLUME $saved_array(VOLUME)
+  #set PRESS [expr 1.01325 * pow(1.4383, -5)]
+  set POTENTIAL [expr $saved_array(TOTAL) - $saved_array(KINETIC)];
+  set colvar [expr $saved_array(MISC)]
+
+  puts $history_file "$i_step $replica(index) $NEWTEMP $TEMP $POTENTIAL $colvar"
+
+  set cindex [expr int(floor($i_run/($steps_per_chain./$steps_per_run))) % $num_chains]
+  for { set i 0 } { $i < $chain($cindex.num_blocks) } { incr i } {
+     if {[lsearch $chain($cindex.block.$i) $replica(index)] > -1} {
+        set block $i
+        break
+     }
+  }
+
+  set block_root [lindex $chain($cindex.block.$block) 0]
+  set num_members [llength $chain($cindex.block.$block)]
+  array unset energy *
+  array unset newloc *
+
+  # evaluate colvar energy difference
+  set ix0 [expr $replica(index) % $num_umbrella]
+  for { set j 0 } { $j < $num_members } { incr j } {
+    set index [lindex $chain($cindex.block.$block) $j]
+    set ix [expr $index % $num_umbrella]
+    if { $ix == $ix0 } {
+      set energy(pot.$replica(index)) $POTENTIAL
+      #set energy(vol.$replica(index)) $VOLUME
+      set energy(diff.$replica(index).$ix) 0.0
+    } else {
+      set energy(diff.$replica(index).$ix) [eval colvarbias [concat energydiff $replica(colvarbias.$ix)]]
+    }
+  }
+
+  if { $replica(index) == $block_root } {
+    set BOLTZMAN 0.001987191
+    
+    # collect potential energy
+    set pot0 0
+    #set vol0 0
+    for { set j 0 } { $j < $num_members } { incr j } {
+      set index [lindex $chain($cindex.block.$block) $j]
+      if { $index != $block_root } {
+        array set energy [replicaRecv $replica(loc.$index)]
+      }
+      #puts stderr "POT $cindex $block $index $replica(loc.$index) $pot($j) $vol($j) RUN $i_run"
+    }
+
+    # compute weight of each configuration
+    set bot 0
+    set avg 0.0
+    for { set i 0 } { $i < $chain($cindex.block.$block.num_perms) } { incr i } {
+      set perm $chain($cindex.block.$block.perm.$i)
+      set rho($i) 0.0
+      for { set j 0 } { $j < $num_members } { incr j } {
+        set index [lindex $chain($cindex.block.$block) $j]
+        set newindex [lindex $perm $j]
+        set ix [expr $newindex % $num_umbrella]
+        set beta [expr 1.0/$replica(temperature.$newindex)/$BOLTZMAN]
+        #set rho($i) [expr $rho($i) + $beta*( $energy(pot.$index) + $energy(diff.$index.$ix) + $PRESS*$energy(vol.$index) )]
+        set rho($i) [expr $rho($i) + $beta*( $energy(pot.$index) + $energy(diff.$index.$ix) )]
+      }
+      set avg [expr $avg + $rho($i)]
+    }
+    set avg [expr $avg / $chain($cindex.block.$block.num_perms)]
+
+    for { set i 0 } { $i < $chain($cindex.block.$block.num_perms) } { incr i } {
+      set rho($i) [expr exp(-$rho($i) + $avg)]
+      set bot [expr $rho($i) + $bot]
+    }
+
+    # pick configuration based on their weight
+    set rnd [expr rand()]
+    for { set i 0 } { $i < $chain($cindex.block.$block.num_perms) } { incr i } {
+      set conf $chain($cindex.block.$block.perm.$i)
+      set rho($i) [expr $rho($i) / $bot]
+      if { $rnd < $rho($i) } {
+        #puts stderr "NEWCONF $block ($conf) $rho($i)"
+        break
+      }
+      set rnd [expr $rnd - $rho($i)]
+    }
+
+    # push new conditions to each replica in the block
+    for { set j 0 } { $j < $num_members } { incr j } {
+      set index [lindex $chain($cindex.block.$block) $j]
+      set newindex [lindex $conf $j]
+      if { $index == $block_root } {
+        set replica(newindex) $newindex
+      } else {
+        replicaSend $newindex $replica(loc.$index)
+      }
+      set newloc(loc.$newindex) $replica(loc.$index)
+    }
+  }
+  if { $replica(index) != $block_root } {
+    set energy(pot.$replica(index)) $POTENTIAL
+    #set energy(vol.$replica(index)) $VOLUME
+    replicaSend [array get energy] $replica(loc.$block_root)
+    set replica(newindex) [replicaRecv $replica(loc.$block_root)]
+  }
+
+  # update condition/replica association map
+  if { $replica(index) == $block_root } {
+    for { set j 0 } { $j < $chain($cindex.num_blocks) } { incr j } {
+      if { $j != $block } {
+        set rid $replica(loc.[lindex $chain($cindex.block.$j) 0])
+        array set newloc [replicaSendrecv [array get newloc] $rid $rid]
+      }
+    }
+
+    for { set j 0 } { $j < $num_members } { incr j } {
+      set index [lindex $chain($cindex.block.$block) $j]
+      if { $index != $block_root } {
+        replicaSend [array get newloc] $replica(loc.$index)
+      }
+    }
+  } else {
+    array set newloc [replicaRecv $replica(loc.$block_root)]
+  }
+
+  for { set j 0 } { $j < $num_replicas } { incr j } {
+    set replica(loc.$j) $newloc(loc.$j)
+  }
+
+
+  if { $replica(index) != $replica(newindex) } {
+    set OLDTEMP $replica(temperature.$replica(index))
+    set NEWTEMP $replica(temperature.$replica(newindex))
+    eval colvarbias [concat changeconfig $replica(colvarbias.$replica(newindex))]
+    rescalevels [expr sqrt(1.0*$NEWTEMP/$OLDTEMP)]
+    langevinTemp $NEWTEMP
+    langevinPistonTemp $NEWTEMP
+    set replica(index) $replica(newindex)
+  }
+
+  #puts stderr "$block replica #$replica(index) now now on rank $r"
+  #replicaBarrier
+
+  #puts stderr "iteration $i_run replica $replica(index) now on rank $r"
+  #replicaBarrier
+
+  incr i_run
+
+  if { $i_run % ($runs_per_frame * $frames_per_restart) == 0 ||
+        $i_run == $num_runs } {  # restart
+    set restart_root "$job_output_root.restart$i_run"
+    set rroot [format $restart_root.$replica_id $replica_id]
+    output $rroot
+    set oroot [format $job_output_root.$replica_id $replica_id]
+    file rename -force $oroot.colvars.state $rroot.colvars.state
+    set rfile [open [format "$restart_root.$replica_id.tcl" $replica_id] "w"]
+    puts $rfile [list array set replica [array get replica]]
+    close $rfile
+    replicaBarrier
+    if { $replica_id == 0 } {
+      set rfile [open [format "$restart_root.tcl" ""] "w"]
+      puts $rfile [list set i_job [expr $i_job + 1]]
+      puts $rfile [list set i_run $i_run]
+      puts $rfile [list set i_step $i_step]
+      puts $rfile [list set restart_root $restart_root]
+      close $rfile
+      if [info exists old_restart_root] {
+        set oldroot [format $old_restart_root ""]
+        file delete $oldroot.tcl
+      }
+    }
+    replicaBarrier
+    if [info exists old_restart_root] {
+      set oldroot [format $old_restart_root $replica_id]
+      file delete $oldroot.$replica_id.tcl
+      file delete $oldroot.$replica_id.coor
+      file delete $oldroot.$replica_id.vel
+      file delete $oldroot.$replica_id.xsc
+      file delete $oldroot.$replica_id.colvars.state
+    }
+    set old_restart_root $restart_root
+  }
+}
+
+replicaBarrier
+
+
